@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 
+import aiohttp
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -22,9 +23,9 @@ from sqlalchemy import select
 
 from ..config import config
 from ..db import Session
-from ..image_pipeline import find_font, render_text_sticker
+from ..image_pipeline import find_font, process_image, render_text_sticker
 from ..keyboards import main_menu
-from ..models import Pack, Sentence, Sticker, User
+from ..models import Asset, Pack, Sentence, Sticker, User
 from ..seed_data import STYLES, TOPICS
 from ..states import BuildForMe
 from ..sticker_service import create_pack
@@ -32,6 +33,27 @@ from ..sticker_service import create_pack
 router = Router()
 FONT = find_font(config.fa_font_path)
 DRAFT_SIZE = 5
+
+_ASSET_RAW: dict[str, bytes] = {}
+
+
+async def _asset_bytes(url: str) -> bytes | None:
+    """Fetch (and cache in-process) a suggestion-asset image by URL."""
+    if url in _ASSET_RAW:
+        return _ASSET_RAW[url]
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                    url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+    except Exception:
+        return None
+    if len(_ASSET_RAW) > 40:
+        _ASSET_RAW.clear()
+    _ASSET_RAW[url] = data
+    return data
 
 
 async def start_build_for_me(message: Message, state: FSMContext) -> None:
@@ -67,12 +89,27 @@ async def _make_draft(message: Message, state: FSMContext, label: str,
     if not pool:
         await message.answer("بانک جمله خالیه؛ اول از پنل ادمین جمله اضافه کن.")
         return
+    # Attach a real character image to each draft sticker (the bot's own
+    # asset bank, matched by category): a suggestion must be a COMPLETE
+    # sticker — image + caption — not bare text with an emoji.
+    async with Session() as s:
+        arows = (await s.execute(
+            select(Asset).where(Asset.approved.is_(True),
+                                Asset.category == (category or ""))
+        )).scalars().all()
+        if not arows:
+            arows = (await s.execute(
+                select(Asset).where(Asset.approved.is_(True))
+            )).scalars().all()
+    asset_urls = [r.file_url for r in arows if r.file_url]
     style_keys = [k for k, _ in STYLES]
     draft = []
     for i in range(min(DRAFT_SIZE, len(pool))):
         item = pool[i]
         draft.append({"sentence": item["text"], "emoji": item["emoji"],
                       "style": style_keys[i % len(style_keys)],
+                      "asset": asset_urls[i % len(asset_urls)]
+                      if asset_urls else "",
                       "pool_idx": i})
     await state.update_data(bf_topic=label, bf_category=category,
                             bf_pool=pool, bf_draft=draft)
@@ -94,12 +131,23 @@ async def _draft_renders(state: FSMContext) -> list[bytes]:
     dirty = False
     for d in draft:
         sig = (f"{d['sentence']}|{d.get('style', 'clean')}"
-               f"|{d.get('emoji', '')}")
+               f"|{d.get('emoji', '')}|{d.get('asset', '')}")
         b64 = cache.get(sig)
         if b64 is None:
-            webp = await asyncio.to_thread(
-                render_text_sticker, d["sentence"], d.get("style", "clean"),
-                FONT, d.get("emoji", ""))
+            webp = None
+            if d.get("asset"):
+                raw = await _asset_bytes(d["asset"])
+                if raw:
+                    try:
+                        webp = await asyncio.to_thread(
+                            process_image, raw, d["sentence"],
+                            d.get("style", "clean"), config.use_rembg, FONT)
+                    except Exception:
+                        webp = None
+            if webp is None:
+                webp = await asyncio.to_thread(
+                    render_text_sticker, d["sentence"],
+                    d.get("style", "clean"), FONT, d.get("emoji", ""))
             b64 = base64.b64encode(webp).decode()
             cache[sig] = b64
             dirty = True
