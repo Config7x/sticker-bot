@@ -76,6 +76,52 @@ def _fit_512(img: Image.Image) -> Image.Image:
                       Image.LANCZOS)
 
 
+def normalize_512(img: Image.Image) -> Image.Image:
+    """Force Telegram's static-sticker geometry on ANY image.
+
+    Telegram rejects a static sticker unless one side is EXACTLY 512 px
+    and the other is <= 512 (Bad Request: STICKER_PNG_DIMENSIONS). This is
+    the single normalization every sticker output path must end with:
+    scale so the longest side becomes 512 (the short side stays <= 512,
+    so tiny images are never blown up past 512 on the short side either),
+    and if float rounding ever leaves the long side at 511, pad with
+    transparency so one side is exactly 512.
+    """
+    img = img.convert("RGBA")
+    w, h = img.size
+    if max(w, h) != MAX_SIDE:
+        scale = MAX_SIDE / max(w, h)
+        nw = min(MAX_SIDE, max(1, round(w * scale)))
+        nh = min(MAX_SIDE, max(1, round(h * scale)))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        w, h = img.size
+    if w != MAX_SIDE and h != MAX_SIDE:
+        # Rounding left the long side short of 512: pad it out with
+        # transparency instead of scaling (keeps the content untouched).
+        nw = MAX_SIDE if w >= h else w
+        nh = MAX_SIDE if h > w else h
+        canvas = Image.new("RGBA", (nw, nh), (0, 0, 0, 0))
+        canvas.alpha_composite(img, ((nw - w) // 2, (nh - h) // 2))
+        img = canvas
+    return img
+
+
+def _pad_to_512(img: Image.Image) -> Image.Image:
+    """Center content (already <= 512) on a transparent canvas whose long
+    side is exactly 512, WITHOUT rescaling the content. Used by the WebP
+    size step-down: transparent padding compresses almost for free."""
+    w, h = img.size
+    if max(w, h) > MAX_SIDE:
+        return normalize_512(img)
+    if max(w, h) == MAX_SIDE:
+        return img
+    nw = MAX_SIDE if w >= h else w
+    nh = MAX_SIDE if h > w else h
+    canvas = Image.new("RGBA", (nw, nh), (0, 0, 0, 0))
+    canvas.alpha_composite(img, ((nw - w) // 2, (nh - h) // 2))
+    return canvas
+
+
 def _with_outline_and_shadow(img: Image.Image, style: str) -> Image.Image:
     outline_px, color, shadow_alpha = STYLE_OUTLINE.get(style, STYLE_OUTLINE["clean"])
     if outline_px <= 0 and shadow_alpha <= 0:
@@ -136,17 +182,26 @@ def _draw_text(base: Image.Image, text: str, font_path: str | None,
 
 
 def _to_webp(img: Image.Image) -> bytes:
-    """Encode WebP, stepping quality/scale down until <= 512 KB."""
+    """Encode WebP <= 512 KB WITHOUT breaking the 512 geometry.
+
+    Quality steps first. If the image is still too big, shrink the content
+    and pad it back onto a transparent canvas with a 512 long side (via
+    _pad_to_512) instead of returning a <512 image, which Telegram would
+    reject with STICKER_PNG_DIMENSIONS.
+    """
     cur = img
-    for _ in range(6):
-        for quality in (92, 85, 75, 65, 55):
+    data = b""
+    for _ in range(7):
+        for quality in (92, 85, 75, 65, 55, 45, 35):
             buf = io.BytesIO()
             cur.save(buf, format="WEBP", quality=quality, method=6)
             data = buf.getvalue()
             if len(data) <= MAX_BYTES:
                 return data
         w, h = cur.size
-        cur = cur.resize((int(w * 0.9), int(h * 0.9)), Image.LANCZOS)
+        shrunk = cur.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))),
+                            Image.LANCZOS)
+        cur = _pad_to_512(shrunk)
     return data  # best effort
 
 
@@ -182,7 +237,9 @@ def render_text_sticker(text: str, style: str = "clean",
         d.text((x, y - box[1]), line, font=font, fill=(255, 255, 255, 255),
                stroke_width=5, stroke_fill=(0, 0, 0, 255))
         y += (box[3] - box[1]) + 26
-    return _to_webp(_trim(canvas))
+    # _trim shrinks the canvas to the text, so normalize afterwards:
+    # without this the WebP has no 512 side and Telegram rejects the pack.
+    return _to_webp(normalize_512(_trim(canvas)))
 
 
 def process_image(source: bytes | str, text: str | None = None,
@@ -203,11 +260,87 @@ def process_image(source: bytes | str, text: str | None = None,
         img.thumbnail((MAX_SIDE, int(MAX_SIDE * 0.78)), Image.LANCZOS)
         img = _with_outline_and_shadow(img, style)
         img = _draw_text(img, text, font_path, style)
-        if max(img.size) > MAX_SIDE:  # text may have grown the canvas
-            img.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
     else:
         img = _fit_512(img)
         img = _with_outline_and_shadow(img, style)
-        if max(img.size) > MAX_SIDE:
-            img = _fit_512(img)
-    return _to_webp(img)
+    # Single exit normalization: whatever the steps above produced (text
+    # composition grows the canvas, thumbnails never upscale), the final
+    # sticker MUST have one side exactly 512 and the other <= 512.
+    return _to_webp(normalize_512(img))
+
+
+# ---------------------------------------------------------------------------
+# style contact sheet (wizard style step preview, SPEC 4)
+# ---------------------------------------------------------------------------
+
+def _sample_subject_png() -> bytes:
+    """A simple smiling-face subject drawn with Pillow, used to show what
+    each style's outline/shadow treatment actually looks like."""
+    img = Image.new("RGBA", (400, 400), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([60, 60, 340, 340], fill=(255, 205, 60, 255))
+    d.ellipse([140, 150, 175, 200], fill=(40, 40, 40, 255))
+    d.ellipse([225, 150, 260, 200], fill=(40, 40, 40, 255))
+    d.arc([140, 190, 260, 290], start=15, end=165, fill=(40, 40, 40, 255),
+          width=12)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _label_text(title: str) -> str:
+    """Strip emoji/symbols from a style title so it can be drawn as a
+    label with the Persian font (which has no emoji glyphs)."""
+    keep = [ch for ch in title
+            if ch.isalpha() or ch.isdigit() or ch in " وـ"]
+    return "".join(keep).strip() or title
+
+
+def render_style_sheet(sample_text: str = "سلام",
+                       font_path: str | None = None,
+                       styles: list[tuple[str, str]] | None = None) -> bytes:
+    """Contact sheet: the sample word rendered once per style, side by
+    side in a labeled grid, so the user SEES the styles (SPEC 4: style
+    step shows a visual sample per option, not just names).
+
+    Each cell runs the real pipeline (sample subject + sample text in
+    that style), so outline/shadow/bubble differences are genuine.
+    Returns PNG bytes for send_photo.
+    """
+    if styles is None:
+        from .seed_data import STYLES as styles  # local import: no cycle
+    subject = _sample_subject_png()
+    cells: list[tuple[Image.Image, str]] = []
+    for key, title in styles:
+        webp = process_image(subject, text=sample_text, style=key,
+                             use_rembg=False, font_path=font_path)
+        cells.append((Image.open(io.BytesIO(webp)).convert("RGBA"),
+                      _label_text(title)))
+
+    cols = 3
+    rows = (len(cells) + cols - 1) // cols
+    cell_w, thumb, label_h = 340, 320, 58
+    cell_h = thumb + label_h
+    sheet = Image.new("RGBA", (cols * cell_w, rows * cell_h),
+                      (52, 56, 68, 255))
+    d = ImageDraw.Draw(sheet)
+    try:
+        label_font = (ImageFont.truetype(font_path, 38) if font_path
+                      else ImageFont.load_default())
+    except Exception:
+        label_font = ImageFont.load_default()
+    for i, (cell, label) in enumerate(cells):
+        cx, cy = (i % cols) * cell_w, (i // cols) * cell_h
+        thumb_img = cell.copy()
+        thumb_img.thumbnail((thumb, thumb), Image.LANCZOS)
+        sheet.alpha_composite(
+            thumb_img, (cx + (cell_w - thumb_img.width) // 2,
+                        cy + (thumb - thumb_img.height) // 2))
+        shaped = shape_fa(label) if font_path else label
+        box = d.textbbox((0, 0), shaped, font=label_font)
+        tw = box[2] - box[0]
+        d.text((cx + (cell_w - tw) // 2 - box[0], cy + thumb + 8 - box[1]),
+               shaped, font=label_font, fill=(255, 255, 255, 255))
+    buf = io.BytesIO()
+    sheet.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
