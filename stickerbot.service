@@ -1,0 +1,16 @@
+[Unit]
+Description=Config7x Sticker Maker Bot (Phase 1)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/stickerbot
+EnvironmentFile=/etc/stickerbot.env
+ExecStart=/opt/stickerbot/.venv/bin/python run.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
