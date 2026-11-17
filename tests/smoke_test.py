@@ -94,13 +94,44 @@ def test_suggestions() -> None:
           and s2.rejected == s.rejected)
 
 
+def _dims(data: bytes) -> tuple[int, int]:
+    from PIL import Image
+
+    return Image.open(io.BytesIO(data)).size
+
+
+def _sticker_geometry_ok(data: bytes) -> bool:
+    """Telegram static-sticker rule: one side EXACTLY 512, other <= 512,
+    WebP, <= 512 KB. (Regression guard for STICKER_PNG_DIMENSIONS.)"""
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return False
+    if len(data) > 512 * 1024:
+        return False
+    w, h = _dims(data)
+    return max(w, h) == 512 and min(w, h) <= 512
+
+
 def test_image_pipeline() -> None:
     from PIL import Image, ImageDraw
 
-    from app.image_pipeline import find_font, process_image, render_text_sticker
+    from app.image_pipeline import (
+        find_font,
+        normalize_512,
+        process_image,
+        render_style_sheet,
+        render_text_sticker,
+    )
+    from app.seed_data import STYLES
 
     font = find_font("")
     check("font: a Noto Arabic font is found", font is not None, str(font))
+
+    # normalize_512 on raw geometry edge cases.
+    for size, want in (((100, 50), (512, 256)), ((2000, 1000), (512, 256)),
+                       ((511, 300), (512, 301)), ((10, 10), (512, 512)),
+                       ((300, 511), (301, 512)), ((512, 512), (512, 512))):
+        got = normalize_512(Image.new("RGBA", size, (10, 20, 30, 255))).size
+        check(f"normalize_512: {size} -> {want}", got == want, str(got))
 
     img = Image.new("RGBA", (800, 600), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -109,24 +140,46 @@ def test_image_pipeline() -> None:
     img.save(buf, format="PNG")
     raw = buf.getvalue()
 
-    out = process_image(raw, text="سلام دنیا", style="clean",
-                        use_rembg=False, font_path=font)
-    check("pipeline: output is WebP", out[:4] == b"RIFF" and out[8:12] == b"WEBP")
-    check("pipeline: output <= 512 KB", len(out) <= 512 * 1024, f"{len(out)} B")
-    decoded = Image.open(io.BytesIO(out))
-    check("pipeline: long side <= 512", max(decoded.size) <= 512, str(decoded.size))
+    # Photo pipeline, with and without text, several styles: the long
+    # side must be EXACTLY 512 (not just <= 512) or Telegram rejects it.
+    for style in ("clean", "neon", "bubble", "minimal"):
+        out = process_image(raw, text="سلام دنیا", style=style,
+                            use_rembg=False, font_path=font)
+        check(f"pipeline: photo+text [{style}] exact-512 geometry",
+              _sticker_geometry_ok(out), str(_dims(out)))
+    for style in ("clean", "bold"):
+        out = process_image(raw, text=None, style=style,
+                            use_rembg=False, font_path=font)
+        check(f"pipeline: photo only [{style}] exact-512 geometry",
+              _sticker_geometry_ok(out), str(_dims(out)))
 
-    out2 = process_image(raw, text=None, style="neon",
-                         use_rembg=False, font_path=font)
-    decoded2 = Image.open(io.BytesIO(out2))
-    check("pipeline: no-text variant ok, long side == 512",
-          out2[:4] == b"RIFF" and max(decoded2.size) == 512, str(decoded2.size))
+    # A small photo must be scaled UP so one side is exactly 512.
+    small = Image.new("RGBA", (120, 90), (0, 0, 0, 0))
+    ImageDraw.Draw(small).ellipse([10, 10, 110, 80], fill=(40, 180, 60, 255))
+    sbuf = io.BytesIO()
+    small.save(sbuf, format="PNG")
+    out_small = process_image(sbuf.getvalue(), text=None, style="clean",
+                              use_rembg=False, font_path=font)
+    check("pipeline: small photo upscaled to exact-512 geometry",
+          _sticker_geometry_ok(out_small), str(_dims(out_small)))
 
-    out3 = render_text_sticker("مرسی!", "clean", font, "🙏")
-    decoded3 = Image.open(io.BytesIO(out3))
-    check("pipeline: text-only sticker ok",
-          out3[:4] == b"RIFF" and len(out3) <= 512 * 1024
-          and max(decoded3.size) <= 512, str(decoded3.size))
+    # Text-only stickers (the «بساز برام» path): several texts x all
+    # styles — this is the exact output that failed live with
+    # STICKER_PNG_DIMENSIONS before the normalization fix.
+    texts = [("سلام", "👋"), ("مرسی! خیلی ممنون از لطفت", "🙏"),
+             ("😂😂😂", "😂"), ("یه جمله نسبتاً طولانی برای تست کوچیک شدن فونت و جا شدن توی قاب", "✨")]
+    for text, emoji in texts:
+        for key, _title in STYLES:
+            out = render_text_sticker(text, key, font, emoji)
+            check(f"text sticker: exact-512 [{key}] «{text[:12]}»",
+                  _sticker_geometry_ok(out), str(_dims(out)))
+
+    # Style contact sheet renders and is a real image.
+    sheet = render_style_sheet("سلام", font, STYLES)
+    simg = Image.open(io.BytesIO(sheet))
+    check("style sheet: PNG with all styles in a grid",
+          sheet[:8] == b"\x89PNG\r\n\x1a\n" and simg.width >= 1000
+          and simg.height >= 700, str(simg.size))
 
 
 async def test_db_and_locks() -> None:
