@@ -27,7 +27,12 @@ from sqlalchemy import select
 
 from ..config import config
 from ..db import Session, get_setting
-from ..image_pipeline import find_font, process_image, render_text_sticker
+from ..image_pipeline import (
+    find_font,
+    process_image,
+    render_style_sheet,
+    render_text_sticker,
+)
 from ..keyboards import preview_kb, seen_list_kb, suggestion_kb
 from ..models import Asset, Pack, Sentence, Sticker, User
 from ..seed_data import EMOJI_SETS, STYLES, TOPICS
@@ -40,6 +45,16 @@ router = Router()
 FONT = find_font(config.fa_font_path)
 TMP = Path(os.getenv("SB_TMP", "/tmp/stickerbot"))
 TMP.mkdir(parents=True, exist_ok=True)
+
+_STYLE_SHEET: bytes | None = None  # contact sheet is rendered once per process
+
+
+async def _style_sheet_bytes() -> bytes:
+    global _STYLE_SHEET
+    if _STYLE_SHEET is None:
+        _STYLE_SHEET = await asyncio.to_thread(
+            render_style_sheet, "سلام", FONT, STYLES)
+    return _STYLE_SHEET
 
 STEP_TITLES = {
     "topic": "۱️⃣ موضوع پک",
@@ -101,6 +116,23 @@ async def type_static(cb: CallbackQuery, state: FSMContext) -> None:
     await _goto_step(cb.message, state, "topic")
 
 
+@router.callback_query(F.data == "wiz:img:own")
+async def image_own_photo(cb: CallbackQuery, state: FSMContext) -> None:
+    """Image step, no ready images: user sends their own photo."""
+    await state.update_data(manual_for="image", edit_mode=False)
+    await state.set_state(Wizard.manual_input)
+    await cb.message.answer("📷 عکست رو بفرست (به‌صورت عکس):")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "wiz:img:text")
+async def image_text_only(cb: CallbackQuery, state: FSMContext,
+                          bot: Bot) -> None:
+    """Image step, no ready images: build a text-only sticker instead."""
+    await cb.answer()
+    await _apply_skip(cb.message, state, "image", bot)
+
+
 # --------------------------------------------------------------------------
 # step setup: build the suggestion pool, then show the viewer
 # --------------------------------------------------------------------------
@@ -125,12 +157,15 @@ async def _pool_for(step: str, data: dict) -> list[dict]:
                 select(Asset).where(Asset.approved.is_(True))
             )).scalars().all()
         for r in rows:
+            # Assets without a real file (seed placeholders) are skipped
+            # silently: never offered, never mentioned to the user.
             if r.file_id or r.file_url:
                 items.append({"id": f"asset:{r.id}", "label": r.title,
                               "file_id": r.file_id, "file_url": r.file_url})
         query = (data.get("current") or {}).get("sentence") or \
             (data.get("topic") or {}).get("label") or "sticker"
-        items += await live_search(str(query), limit=6)
+        items += [it for it in await live_search(str(query), limit=6)
+                  if it.get("file_url")]
         return items
     if step == "style":
         return [{"id": f"style:{k}", "label": t, "key": k} for k, t in STYLES]
@@ -163,7 +198,32 @@ async def _goto_step(message: Message, state: FSMContext, step: str) -> None:
                  "image": Wizard.step_image, "style": Wizard.step_style,
                  "emoji": Wizard.step_emoji, "name": Wizard.step_name}
     await state.set_state(state_map[step])
+    if step == "style":
+        # Styles must be SEEN, not just named: one contact sheet with the
+        # sample word rendered in every style (SPEC 4).
+        try:
+            sheet = await _style_sheet_bytes()
+            await message.answer_photo(
+                BufferedInputFile(sheet, filename="styles.png"),
+                caption="🎨 نمونه همه سبک‌ها با کلمه «سلام» 👆\n"
+                        "حالا از پیشنهادهای زیر، سبکت رو انتخاب کن:")
+        except Exception:
+            pass  # the step itself must go on even if the sheet fails
     await _show_current(message, state)
+
+
+def _image_empty_kb() -> InlineKeyboardMarkup:
+    """Image step when no ready image is available: the two clear paths
+    (own photo / text-only sticker) — never an error or a dead end."""
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📷 عکس خودم رو می‌فرستم",
+                               callback_data="wiz:img:own"))
+    b.row(InlineKeyboardButton(text="🔤 استیکر متنی بساز",
+                               callback_data="wiz:img:text"))
+    b.row(InlineKeyboardButton(text="🏁 تمام و ساخت پک",
+                               callback_data="wiz:finish"))
+    b.row(InlineKeyboardButton(text="❌ لغو ساخت", callback_data="wiz:cancel"))
+    return b.as_markup()
 
 
 async def _show_current(message: Message, state: FSMContext) -> None:
@@ -176,19 +236,29 @@ async def _show_current(message: Message, state: FSMContext) -> None:
                        has_more=session.has_more())
     title = STEP_TITLES.get(step, "")
     if item is None:
+        if step == "image":
+            await message.answer(
+                f"{title}\n\n"
+                "برای این استیکر، یکی از این دو راه رو انتخاب کن 👇",
+                reply_markup=_image_empty_kb())
+            return
         await message.answer(
             f"{title}\nپیشنهاد آماده‌ای برای این قدم نیست؛ "
             "می‌تونی خودت وارد کنی یا ردش کنی.", reply_markup=kb)
         return
     pos = session.position_label()
     if step == "image" and (item.get("file_id") or item.get("file_url")):
+        # Show the actual image so the user sees it before choosing.
         media = item.get("file_id") or item.get("file_url")
-        await message.answer_photo(
-            media, caption=f"{title}\n{item.get('label', '')}\n📍 {pos}",
-            reply_markup=kb)
-    else:
-        await message.answer(f"{title}\n\n{item.get('label', '')}\n\n📍 {pos}",
-                             reply_markup=kb)
+        try:
+            await message.answer_photo(
+                media, caption=f"{title}\n{item.get('label', '')}\n📍 {pos}",
+                reply_markup=kb)
+            return
+        except Exception:
+            pass  # fall through to the text view if the media fails
+    await message.answer(f"{title}\n\n{item.get('label', '')}\n\n📍 {pos}",
+                         reply_markup=kb)
 
 
 # --------------------------------------------------------------------------
