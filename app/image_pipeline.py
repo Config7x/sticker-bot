@@ -12,10 +12,21 @@ import glob
 import io
 import os
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, features
 
 MAX_SIDE = 512
 MAX_BYTES = 512 * 1024
+
+# When Pillow is built with libraqm, IT shapes and orders Persian text
+# natively. Applying arabic_reshaper + python-bidi ON TOP of raqm double-
+# processes the text and produces reversed, disconnected garbage (the
+# exact bug users saw live). So: raqm -> draw the RAW text with
+# direction="rtl"; no raqm -> fall back to reshaper + bidi.
+RAQM = features.check("raqm")
+
+
+def _text_kw() -> dict:
+    return {"direction": "rtl", "language": "fa"} if RAQM else {}
 
 _FONT_PATTERNS = [
     "/usr/share/fonts/**/NotoNaskhArabic-Bold*.ttf",
@@ -46,11 +57,53 @@ def find_font(configured: str = "") -> str | None:
 
 
 def shape_fa(text: str) -> str:
-    """Shape + bidi Persian/Arabic text for correct Pillow rendering."""
+    """Prepare Persian/Arabic text for Pillow.
+
+    With raqm the text must stay RAW (Pillow shapes + orders it); without
+    raqm, shape + bidi it manually.
+    """
+    if RAQM:
+        return text
     import arabic_reshaper
     from bidi.algorithm import get_display
 
     return get_display(arabic_reshaper.reshape(text))
+
+
+def _find_emoji_font() -> str | None:
+    for pattern in ("/usr/share/fonts/**/NotoColorEmoji.ttf",
+                    os.path.expanduser("~/.fonts/NotoColorEmoji.ttf")):
+        for hit in sorted(glob.glob(pattern, recursive=True)):
+            return hit
+    return None
+
+
+def _emoji_image(emoji: str, size_px: int) -> Image.Image | None:
+    """Render an emoji with the COLOR emoji font as a small RGBA image.
+
+    The Persian text font has no emoji glyphs at all — drawing an emoji
+    with it yields an empty .notdef rectangle (the white boxes users
+    saw). Noto Color Emoji is a bitmap font: it must be loaded at its
+    native 109 px strike and drawn with embedded_color=True.
+    Returns None when no color emoji font is available (the emoji is
+    sticker metadata anyway, so skipping it in the image is safe).
+    """
+    path = _find_emoji_font()
+    if not emoji or not path:
+        return None
+    try:
+        font = ImageFont.truetype(path, 109)
+        tmp = Image.new("RGBA", (170, 170), (0, 0, 0, 0))
+        d = ImageDraw.Draw(tmp)
+        d.text((15, 15), emoji, font=font, embedded_color=True)
+        bbox = tmp.getbbox()
+        if not bbox:
+            return None
+        glyph = tmp.crop(bbox)
+        glyph.thumbnail((size_px, size_px), Image.LANCZOS)
+        return glyph
+    except Exception:
+        return None
 
 
 def _try_rembg(img: Image.Image) -> Image.Image:
@@ -155,16 +208,17 @@ def _draw_text(base: Image.Image, text: str, font_path: str | None,
     if not font_path:
         return base
     shaped = shape_fa(text)
+    kw = _text_kw()
     probe = ImageDraw.Draw(base)
     size = 64
     font = ImageFont.truetype(font_path, size)
     while size > 18:
-        box = probe.textbbox((0, 0), shaped, font=font, stroke_width=2)
+        box = probe.textbbox((0, 0), shaped, font=font, stroke_width=2, **kw)
         if box[2] - box[0] <= base.width - 24:
             break
         size -= 4
         font = ImageFont.truetype(font_path, size)
-    box = probe.textbbox((0, 0), shaped, font=font, stroke_width=2)
+    box = probe.textbbox((0, 0), shaped, font=font, stroke_width=2, **kw)
     tw, th = box[2] - box[0], box[3] - box[1]
     out = Image.new("RGBA", (base.width, base.height + th + 28), (0, 0, 0, 0))
     out.alpha_composite(base, (0, 0))
@@ -174,10 +228,10 @@ def _draw_text(base: Image.Image, text: str, font_path: str | None,
         d.rounded_rectangle([x + box[0] - 14, y + box[1] - 8,
                              x + box[2] + 14, y + box[3] + 8],
                             radius=18, fill=(255, 255, 255, 235))
-        d.text((x, y), shaped, font=font, fill=(20, 20, 20, 255))
+        d.text((x, y), shaped, font=font, fill=(20, 20, 20, 255), **kw)
     else:
         d.text((x, y), shaped, font=font, fill=(255, 255, 255, 255),
-               stroke_width=3, stroke_fill=(0, 0, 0, 255))
+               stroke_width=3, stroke_fill=(0, 0, 0, 255), **kw)
     return out
 
 
@@ -214,30 +268,34 @@ def render_text_sticker(text: str, style: str = "clean",
     """
     canvas = Image.new("RGBA", (MAX_SIDE, MAX_SIDE), (0, 0, 0, 0))
     d = ImageDraw.Draw(canvas)
-    lines: list[str] = []
-    if emoji:
-        lines.append(emoji)
-    lines.append(shape_fa(text) if text else "")
-    y = 150
-    for line in lines:
-        if not line:
-            continue
-        size = 110 if line == (emoji or None) else 84
-        font = ImageFont.truetype(font_path, size) if font_path else None
-        if font is None:
-            break
+    kw = _text_kw()
+    y = 56
+    # Emoji goes in as a COLOR image (its own font), never as text in the
+    # Persian font — that produced empty white rectangles.
+    em_img = _emoji_image(emoji, 132) if emoji else None
+    if em_img is not None:
+        canvas.alpha_composite(em_img, ((MAX_SIDE - em_img.width) // 2, y))
+        y += em_img.height + 26
+    if text and font_path:
+        shaped = shape_fa(text)
+        size = 96
+        font = ImageFont.truetype(font_path, size)
         while size > 24:
-            box = d.textbbox((0, 0), line, font=font, stroke_width=4)
+            box = d.textbbox((0, 0), shaped, font=font, stroke_width=4, **kw)
             if box[2] - box[0] <= MAX_SIDE - 40:
                 break
             size -= 6
             font = ImageFont.truetype(font_path, size)
-        box = d.textbbox((0, 0), line, font=font, stroke_width=4)
-        x = (MAX_SIDE - (box[2] - box[0])) // 2 - box[0]
-        d.text((x, y - box[1]), line, font=font, fill=(255, 255, 255, 255),
-               stroke_width=5, stroke_fill=(0, 0, 0, 255))
-        y += (box[3] - box[1]) + 26
-    # _trim shrinks the canvas to the text, so normalize afterwards:
+        box = d.textbbox((0, 0), shaped, font=font, stroke_width=4, **kw)
+        tw, th = box[2] - box[0], box[3] - box[1]
+        x = (MAX_SIDE - tw) // 2 - box[0]
+        if em_img is not None:
+            yy = y + 6 - box[1]  # sit right under the emoji, no dead gap
+        else:
+            yy = y + max(0, (MAX_SIDE - y - th) // 2) - box[1]
+        d.text((x, yy), shaped, font=font, fill=(255, 255, 255, 255),
+               stroke_width=5, stroke_fill=(0, 0, 0, 255), **kw)
+    # _trim shrinks the canvas to the content, so normalize afterwards:
     # without this the WebP has no 512 side and Telegram rejects the pack.
     return _to_webp(normalize_512(_trim(canvas)))
 
@@ -337,10 +395,11 @@ def render_style_sheet(sample_text: str = "سلام",
             thumb_img, (cx + (cell_w - thumb_img.width) // 2,
                         cy + (thumb - thumb_img.height) // 2))
         shaped = shape_fa(label) if font_path else label
-        box = d.textbbox((0, 0), shaped, font=label_font)
+        kw = _text_kw()
+        box = d.textbbox((0, 0), shaped, font=label_font, **kw)
         tw = box[2] - box[0]
         d.text((cx + (cell_w - tw) // 2 - box[0], cy + thumb + 8 - box[1]),
-               shaped, font=label_font, fill=(255, 255, 255, 255))
+               shaped, font=label_font, fill=(255, 255, 255, 255), **kw)
     buf = io.BytesIO()
     sheet.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
