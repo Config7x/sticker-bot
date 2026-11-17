@@ -139,9 +139,11 @@ async def _draft_renders(state: FSMContext) -> list[bytes]:
                 raw = await _asset_bytes(d["asset"])
                 if raw:
                     try:
+                        # Bank assets ship pre-cut (transparent), so no
+                        # rembg pass is needed for them.
                         webp = await asyncio.to_thread(
                             process_image, raw, d["sentence"],
-                            d.get("style", "clean"), config.use_rembg, FONT)
+                            d.get("style", "clean"), False, FONT)
                     except Exception:
                         webp = None
             if webp is None:
