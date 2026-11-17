@@ -8,10 +8,12 @@ pack through the Bot API and delivers the link.
 from __future__ import annotations
 
 import asyncio
+import base64
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     InlineKeyboardButton,
     Message,
 )
@@ -78,9 +80,49 @@ async def _make_draft(message: Message, state: FSMContext, label: str,
     await _show_preview(message, state)
 
 
+async def _draft_renders(state: FSMContext) -> list[bytes]:
+    """Rendered WebP bytes for the current draft, in draft order.
+
+    Renders are cached in FSM data (base64, keyed by sentence|style|emoji)
+    so the preview shows exactly the bytes that publish will send, and a
+    replaced sticker is the only one re-rendered.
+    """
+    data = await state.get_data()
+    draft = data.get("bf_draft", [])
+    cache: dict[str, str] = dict(data.get("bf_cache") or {})
+    renders: list[bytes] = []
+    dirty = False
+    for d in draft:
+        sig = (f"{d['sentence']}|{d.get('style', 'clean')}"
+               f"|{d.get('emoji', '')}")
+        b64 = cache.get(sig)
+        if b64 is None:
+            webp = await asyncio.to_thread(
+                render_text_sticker, d["sentence"], d.get("style", "clean"),
+                FONT, d.get("emoji", ""))
+            b64 = base64.b64encode(webp).decode()
+            cache[sig] = b64
+            dirty = True
+        renders.append(base64.b64decode(b64))
+    if dirty:
+        if len(cache) > 30:  # keep the FSM payload bounded
+            cache = dict(list(cache.items())[-30:])
+        await state.update_data(bf_cache=cache)
+    return renders
+
+
 async def _show_preview(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     draft = data.get("bf_draft", [])
+    # Show the actual stickers first, so the user sees exactly what will
+    # be published — not just a text list of sentences.
+    renders = await _draft_renders(state)
+    for i, webp in enumerate(renders):
+        upload = BufferedInputFile(webp, filename=f"draft{i + 1}.webp")
+        try:
+            await message.answer_sticker(upload)
+        except Exception:
+            await message.answer_photo(upload)
     lines = [f"✨ پیش‌نویس پک «{data.get('bf_topic', '')}»:\n"]
     for i, d in enumerate(draft):
         lines.append(f"{i + 1}. {d['sentence']}  ({d['emoji']})")
@@ -146,12 +188,10 @@ async def bf_publish(cb, state: FSMContext, bot: Bot) -> None:
         return
     await cb.answer()
     await cb.message.answer("⏳ دارم پک رو می‌سازم...")
-    stickers: list[tuple[bytes, str]] = []
-    for d in draft:
-        webp = await asyncio.to_thread(
-            render_text_sticker, d["sentence"], d.get("style", "clean"),
-            FONT, d.get("emoji", ""))
-        stickers.append((webp, d.get("emoji", "🙂")))
+    # Publish exactly the renders the user saw in the preview (cached).
+    renders = await _draft_renders(state)
+    stickers: list[tuple[bytes, str]] = [
+        (webp, d.get("emoji", "🙂")) for webp, d in zip(renders, draft)]
     title = (data.get("bf_topic") or "پک من")[:64]
     try:
         name = await create_pack(bot, cb.from_user.id, title, stickers)
